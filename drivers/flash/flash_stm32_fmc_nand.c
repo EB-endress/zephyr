@@ -28,6 +28,7 @@ LOG_MODULE_REGISTER(flash_stm32_fmc_nand, CONFIG_FLASH_LOG_LEVEL);
 #define PAGE_BUFFER_ALIGNMENT 4
 
 #define NAND_STATUS_REWRITE_RECOMMENDED BIT(3)
+#define NAND_MAX_FEATURES               4
 
 #define STM32_FMC_NAND_ARRAY_ADDRESS(address, data)                                                \
 	((address)->page +                                                                         \
@@ -70,6 +71,8 @@ struct flash_stm32_fmc_nand_data {
 	size_t block_size;      /* Block size in number of pages */
 	size_t plane_size;      /* Plane size in number of blocks */
 	size_t total_pages;     /* Total number of pages */
+	struct nand_flash_feature features[NAND_MAX_FEATURES]; /* Restored after recovery */
+	size_t feature_count;
 #if STM32_FMC_NAND_USE_DMA
 	struct stream dma;
 #endif /* STM32_FMC_NAND_USE_DMA */
@@ -105,14 +108,35 @@ static int flash_stm32_fmc_nand_wait(void)
 	}
 }
 
-/* Resets the NAND after a timeout or transfer error, features such as on-die ECC are kept */
-static enum nand_state flash_stm32_fmc_nand_recover(void)
+/* FAIL is only defined for program, erase and read, so only a timeout is an error */
+static int flash_stm32_fmc_nand_send_feature(const struct nand_flash_feature *feature)
+{
+	sys_write8(NAND_CMD_SET_FEATURES, NAND_DEVICE | CMD_AREA);
+	sys_write8(feature->feature_addr, NAND_DEVICE | ADDR_AREA);
+	sys_write8(feature->feature_data[0], NAND_DEVICE);
+	sys_write8(feature->feature_data[1], NAND_DEVICE);
+	sys_write8(feature->feature_data[2], NAND_DEVICE);
+	sys_write8(feature->feature_data[3], NAND_DEVICE);
+
+	return (flash_stm32_fmc_nand_wait() == -ETIMEDOUT) ? -ETIMEDOUT : 0;
+}
+
+/* Features survive RESET but not a NAND power loss, so they are always restored */
+static enum nand_state flash_stm32_fmc_nand_recover(struct flash_stm32_fmc_nand_data *dev_data)
 {
 	sys_write8(NAND_CMD_RESET, NAND_DEVICE | CMD_AREA);
 
 	if (flash_stm32_fmc_nand_wait() == -ETIMEDOUT) {
 		LOG_ERR("NAND reset for recovery timed out");
 		return NAND_STATE_ERROR;
+	}
+
+	for (size_t index = 0; index < dev_data->feature_count; index++) {
+		if (flash_stm32_fmc_nand_send_feature(&dev_data->features[index]) != 0) {
+			LOG_ERR("Restoring feature 0x%02x for recovery timed out",
+				dev_data->features[index].feature_addr);
+			return NAND_STATE_ERROR;
+		}
 	}
 
 	LOG_WRN("NAND recovered by reset");
@@ -179,7 +203,7 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if(ret == 1) {
@@ -197,12 +221,12 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		k_sem_reset(&dev_data->dma.sync);
 		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel, NAND_DEVICE,
 			       (uint32_t)config->page_buffer, dev_data->page_size) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover();
+			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
 		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover();
+			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
@@ -211,12 +235,12 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel,
 			       (uint32_t)(config->page_buffer + page_offset), (uint32_t)data,
 			       chunk) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover();
+			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
 		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover();
+			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
@@ -307,7 +331,7 @@ int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == 1) {
@@ -397,7 +421,7 @@ int flash_stm32_fmc_nand_write_page(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -481,7 +505,7 @@ int flash_stm32_fmc_nand_write_spare_area(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -529,7 +553,7 @@ int flash_stm32_fmc_nand_erase_block(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -631,6 +655,7 @@ int flash_stm32_fmc_nand_set_feature(const struct device *dev,
 				     const struct nand_flash_feature *feature)
 {
 	struct flash_stm32_fmc_nand_data *dev_data = dev->data;
+	size_t index;
 	int ret;
 
 	k_sem_take(&dev_data->lock, K_FOREVER);
@@ -643,22 +668,29 @@ int flash_stm32_fmc_nand_set_feature(const struct device *dev,
 		return -EIO;
 	}
 
+	for (index = 0; index < dev_data->feature_count; index++) {
+		if (dev_data->features[index].feature_addr == feature->feature_addr) {
+			break;
+		}
+	}
+
+	if (index == ARRAY_SIZE(dev_data->features)) {
+		k_sem_give(&dev_data->lock);
+		return -ENOMEM;
+	}
+
 	dev_data->state = NAND_STATE_BUSY;
 
-	/* Send feature setting command sequence */
-	sys_write8(NAND_CMD_SET_FEATURES, NAND_DEVICE | CMD_AREA);
-	sys_write8(feature->feature_addr, NAND_DEVICE | ADDR_AREA);
-	sys_write8(feature->feature_data[0], NAND_DEVICE);
-	sys_write8(feature->feature_data[1], NAND_DEVICE);
-	sys_write8(feature->feature_data[2], NAND_DEVICE);
-	sys_write8(feature->feature_data[3], NAND_DEVICE);
-
-	/* FAIL is only defined for program, erase and read, so only a timeout is an error */
-	ret = flash_stm32_fmc_nand_wait();
-	if (ret == -ETIMEDOUT) {
-		dev_data->state = flash_stm32_fmc_nand_recover();
+	ret = flash_stm32_fmc_nand_send_feature(feature);
+	if (ret != 0) {
+		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
 		return ret;
+	}
+
+	dev_data->features[index] = *feature;
+	if (index == dev_data->feature_count) {
+		dev_data->feature_count++;
 	}
 
 	dev_data->state = NAND_STATE_READY;
