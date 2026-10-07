@@ -27,6 +27,8 @@ LOG_MODULE_REGISTER(flash_stm32_fmc_nand, CONFIG_FLASH_LOG_LEVEL);
 #define NAND_TIMEOUT_MS       2000
 #define PAGE_BUFFER_ALIGNMENT 4
 
+#define NAND_STATUS_REWRITE_RECOMMENDED BIT(3)
+
 #define STM32_FMC_NAND_ARRAY_ADDRESS(address, data)                                                \
 	((address)->page +                                                                         \
 	 (((address)->block + ((address)->plane * (data)->plane_size)) * (data)->block_size))
@@ -73,7 +75,7 @@ struct flash_stm32_fmc_nand_data {
 #endif /* STM32_FMC_NAND_USE_DMA */
 };
 
-/* Reads status until NAND is ready or reports an error */
+/* Reads status until NAND is ready, then evaluates FAIL (valid only when RDY = 1) */
 static int flash_stm32_fmc_nand_wait(void)
 {
 	uint8_t status;
@@ -89,14 +91,14 @@ static int flash_stm32_fmc_nand_wait(void)
 
 		if ((status & NAND_READY) == NAND_READY) {
 			break;
-		} else if ((status & NAND_ERROR) == NAND_ERROR) {
-			return -EIO;
 		} else if (sys_timepoint_expired(deadline)) {
 			return -ETIMEDOUT;
 		}
 	}
 
-	if ((status & BIT(3)) == BIT(3)) {
+	if ((status & NAND_ERROR) == NAND_ERROR) {
+		return -EIO;
+	} else if ((status & NAND_STATUS_REWRITE_RECOMMENDED) == NAND_STATUS_REWRITE_RECOMMENDED) {
 		return 1;
 	} else {
 		return 0;
@@ -585,9 +587,9 @@ int flash_stm32_fmc_nand_reset(const struct device *dev)
 	/* Send NAND reset command */
 	sys_write8(NAND_CMD_RESET, NAND_DEVICE | CMD_AREA);
 
-	/* Read status until NAND is ready or reports an error */
+	/* FAIL is only defined for program, erase and read, so only a timeout is an error */
 	ret = flash_stm32_fmc_nand_wait();
-	if (ret < 0) {
+	if (ret == -ETIMEDOUT) {
 		dev_data->state = NAND_STATE_ERROR;
 		k_sem_give(&dev_data->lock);
 		return ret;
@@ -596,7 +598,7 @@ int flash_stm32_fmc_nand_reset(const struct device *dev)
 	dev_data->state = NAND_STATE_READY;
 	k_sem_give(&dev_data->lock);
 
-	return ret;
+	return 0;
 }
 
 int flash_stm32_fmc_nand_set_feature(const struct device *dev,
@@ -625,9 +627,9 @@ int flash_stm32_fmc_nand_set_feature(const struct device *dev,
 	sys_write8(feature->feature_data[2], NAND_DEVICE);
 	sys_write8(feature->feature_data[3], NAND_DEVICE);
 
-	/* Read status until NAND is ready or reports an error */
+	/* FAIL is only defined for program, erase and read, so only a timeout is an error */
 	ret = flash_stm32_fmc_nand_wait();
-	if (ret < 0) {
+	if (ret == -ETIMEDOUT) {
 		dev_data->state = NAND_STATE_ERROR;
 		k_sem_give(&dev_data->lock);
 		return ret;
