@@ -105,6 +105,20 @@ static int flash_stm32_fmc_nand_wait(void)
 	}
 }
 
+/* Resets the NAND after a timeout or transfer error, features such as on-die ECC are kept */
+static enum nand_state flash_stm32_fmc_nand_recover(void)
+{
+	sys_write8(NAND_CMD_RESET, NAND_DEVICE | CMD_AREA);
+
+	if (flash_stm32_fmc_nand_wait() == -ETIMEDOUT) {
+		LOG_ERR("NAND reset for recovery timed out");
+		return NAND_STATE_ERROR;
+	}
+
+	LOG_WRN("NAND recovered by reset");
+	return NAND_STATE_READY;
+}
+
 int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 					 const struct nand_flash_address *address,
 					 off_t page_offset, size_t chunk, uint8_t *data)
@@ -165,7 +179,7 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = NAND_STATE_ERROR;
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if(ret == 1) {
@@ -183,12 +197,12 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		k_sem_reset(&dev_data->dma.sync);
 		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel, NAND_DEVICE,
 			       (uint32_t)config->page_buffer, dev_data->page_size) != 0) {
-			dev_data->state = NAND_STATE_ERROR;
+			dev_data->state = flash_stm32_fmc_nand_recover();
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
 		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = NAND_STATE_ERROR;
+			dev_data->state = flash_stm32_fmc_nand_recover();
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
@@ -197,12 +211,12 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel,
 			       (uint32_t)(config->page_buffer + page_offset), (uint32_t)data,
 			       chunk) != 0) {
-			dev_data->state = NAND_STATE_ERROR;
+			dev_data->state = flash_stm32_fmc_nand_recover();
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
 		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = NAND_STATE_ERROR;
+			dev_data->state = flash_stm32_fmc_nand_recover();
 			k_sem_give(&dev_data->lock);
 			return -EIO;
 		}
@@ -293,7 +307,7 @@ int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = NAND_STATE_ERROR;
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == 1) {
@@ -376,8 +390,14 @@ int flash_stm32_fmc_nand_write_page(const struct device *dev,
 
 	/* Read status until NAND is ready or reports an error */
 	ret = flash_stm32_fmc_nand_wait();
-	if (ret < 0) {
-		dev_data->state = NAND_STATE_ERROR;
+	if (ret == -EIO) {
+		LOG_ERR("Program failed, page=%d block=%d plane=%d", address->page,
+			address->block, address->plane);
+		dev_data->state = NAND_STATE_READY;
+		k_sem_give(&dev_data->lock);
+		return ret;
+	} else if (ret == -ETIMEDOUT) {
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -454,8 +474,14 @@ int flash_stm32_fmc_nand_write_spare_area(const struct device *dev,
 
 	/* Read status until NAND is ready or reports an error */
 	ret = flash_stm32_fmc_nand_wait();
-	if (ret < 0) {
-		dev_data->state = NAND_STATE_ERROR;
+	if (ret == -EIO) {
+		LOG_ERR("Spare area program failed, page=%d block=%d plane=%d", address->page,
+			address->block, address->plane);
+		dev_data->state = NAND_STATE_READY;
+		k_sem_give(&dev_data->lock);
+		return ret;
+	} else if (ret == -ETIMEDOUT) {
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -503,7 +529,7 @@ int flash_stm32_fmc_nand_erase_block(const struct device *dev,
 		k_sem_give(&dev_data->lock);
 		return ret;
 	} else if (ret == -ETIMEDOUT) {
-		dev_data->state = NAND_STATE_ERROR;
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
@@ -630,7 +656,7 @@ int flash_stm32_fmc_nand_set_feature(const struct device *dev,
 	/* FAIL is only defined for program, erase and read, so only a timeout is an error */
 	ret = flash_stm32_fmc_nand_wait();
 	if (ret == -ETIMEDOUT) {
-		dev_data->state = NAND_STATE_ERROR;
+		dev_data->state = flash_stm32_fmc_nand_recover();
 		k_sem_give(&dev_data->lock);
 		return ret;
 	}
