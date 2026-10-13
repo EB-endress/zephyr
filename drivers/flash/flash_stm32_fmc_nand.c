@@ -40,6 +40,7 @@ LOG_MODULE_REGISTER(flash_stm32_fmc_nand, CONFIG_FLASH_LOG_LEVEL);
 struct stream {
 	bool enabled;
 	struct k_sem sync;
+	int status;
 	DMA_TypeDef *reg;
 	const struct device *dev;
 	uint32_t channel;
@@ -143,6 +144,52 @@ static enum nand_state flash_stm32_fmc_nand_recover(struct flash_stm32_fmc_nand_
 	return NAND_STATE_READY;
 }
 
+#if STM32_FMC_NAND_USE_DMA
+static int flash_stm32_fmc_nand_dma_transfer(struct flash_stm32_fmc_nand_data *dev_data,
+					     uint32_t src, uint32_t dst, size_t size)
+{
+	int ret;
+
+	k_sem_reset(&dev_data->dma.sync);
+	dev_data->dma.status = 0;
+
+	ret = dma_reload(dev_data->dma.dev, dev_data->dma.channel, src, dst, size);
+	if (ret != 0) {
+		LOG_ERR("DMA reload failed with error %d", ret);
+		return -EIO;
+	}
+
+	if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
+		LOG_ERR("DMA transfer timed out");
+		return -EIO;
+	}
+
+	return (dev_data->dma.status < 0) ? -EIO : 0;
+}
+
+/* dma_stop() masks the channel interrupts, so the channel is reconfigured before reuse */
+static enum nand_state flash_stm32_fmc_nand_dma_recover(struct flash_stm32_fmc_nand_data *dev_data)
+{
+	int ret;
+
+	ret = dma_stop(dev_data->dma.dev, dev_data->dma.channel);
+	if (ret == 0) {
+		ret = dma_config(dev_data->dma.dev, dev_data->dma.channel, &dev_data->dma.cfg);
+	}
+
+	if (ret != 0) {
+		LOG_ERR("DMA channel %d could not be quiesced, error %d", dev_data->dma.channel,
+			ret);
+		return NAND_STATE_ERROR;
+	}
+
+	/* Discard a completion signalled after the timeout but before dma_stop() */
+	k_sem_reset(&dev_data->dma.sync);
+
+	return flash_stm32_fmc_nand_recover(dev_data);
+}
+#endif /* STM32_FMC_NAND_USE_DMA */
+
 int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 					 const struct nand_flash_address *address,
 					 off_t page_offset, size_t chunk, uint8_t *data)
@@ -217,32 +264,20 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 	if (dev_data->dma.enabled) {
 		const struct flash_stm32_fmc_nand_config *config = dev->config;
 
-		/* Get page data into buffer */
-		k_sem_reset(&dev_data->dma.sync);
-		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel, NAND_DEVICE,
-			       (uint32_t)config->page_buffer, dev_data->page_size) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
-			k_sem_give(&dev_data->lock);
-			return -EIO;
-		}
-		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
-			k_sem_give(&dev_data->lock);
-			return -EIO;
+		/* Get page data into buffer, then the chunk into the output buffer */
+		ret = flash_stm32_fmc_nand_dma_transfer(dev_data, NAND_DEVICE,
+							(uint32_t)config->page_buffer,
+							dev_data->page_size);
+		if (ret == 0) {
+			ret = flash_stm32_fmc_nand_dma_transfer(
+				dev_data, (uint32_t)(config->page_buffer + page_offset),
+				(uint32_t)data, chunk);
 		}
 
-		/* Get chunk into output buffer */
-		if (dma_reload(dev_data->dma.dev, dev_data->dma.channel,
-			       (uint32_t)(config->page_buffer + page_offset), (uint32_t)data,
-			       chunk) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
+		if (ret != 0) {
+			dev_data->state = flash_stm32_fmc_nand_dma_recover(dev_data);
 			k_sem_give(&dev_data->lock);
-			return -EIO;
-		}
-		if (k_sem_take(&dev_data->dma.sync, K_MSEC(DMA_TIMEOUT_MS)) != 0) {
-			dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
-			k_sem_give(&dev_data->lock);
-			return -EIO;
+			return ret;
 		}
 
 	} else {
@@ -726,7 +761,7 @@ static int flash_stm32_fmc_nand_init(const struct device *dev)
 
 		dev_data->dma.cfg.head_block = &dev_data->dma.block_cfg;
 		k_sem_init(&dev_data->dma.sync, 0, 1);
-		dev_data->dma.cfg.user_data = &dev_data->dma.sync;
+		dev_data->dma.cfg.user_data = &dev_data->dma;
 
 		ret = dma_config(dev_data->dma.dev, dev_data->dma.channel, &dev_data->dma.cfg);
 		if (ret != 0) {
@@ -747,13 +782,16 @@ static int flash_stm32_fmc_nand_init(const struct device *dev)
 static void fmc_nand_dma_callback(const struct device *dev, void *user_data, uint32_t channel,
 				  int status)
 {
-	ARG_UNUSED(dev);
+	struct stream *dma = user_data;
 
-	k_sem_give((struct k_sem *)user_data);
+	ARG_UNUSED(dev);
 
 	if (status < 0) {
 		LOG_ERR("DMA callback error %d with channel %d", status, channel);
 	}
+
+	dma->status = status;
+	k_sem_give(&dma->sync);
 }
 
 #define DMA_CHANNEL_CONFIG(node, dir) DT_DMAS_CELL_BY_NAME(node, dir, channel_config)
