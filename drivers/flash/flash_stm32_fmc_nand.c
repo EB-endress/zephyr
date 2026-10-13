@@ -327,9 +327,6 @@ int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 	ret = flash_stm32_fmc_nand_wait();
 	if (ret == -EIO) {
 		LOG_ERR("Uncorrectable ECC error detected, page=%d block=%d plane=%d", address->page, address->block, address->plane);
-		dev_data->state = NAND_STATE_READY;
-		k_sem_give(&dev_data->lock);
-		return ret;
 	} else if (ret == -ETIMEDOUT) {
 		dev_data->state = flash_stm32_fmc_nand_recover(dev_data);
 		k_sem_give(&dev_data->lock);
@@ -341,7 +338,7 @@ int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 	/* Go back to read mode */
 	sys_write8(NAND_CMD_AREA_A, NAND_DEVICE | CMD_AREA);
 
-	/* Get spare area data into output buffer */
+	/* Get spare area data into output buffer, uncorrected on an ECC failure */
 	for (size_t index = 0; index < dev_data->spare_area_size; index++) {
 		*buffer = sys_read8(NAND_DEVICE);
 		buffer++;
@@ -350,7 +347,7 @@ int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 	dev_data->state = NAND_STATE_READY;
 	k_sem_give(&dev_data->lock);
 
-	return 0;
+	return (ret == -EIO) ? -EBADMSG : 0;
 }
 
 int flash_stm32_fmc_nand_write_page(const struct device *dev,

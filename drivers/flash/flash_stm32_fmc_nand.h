@@ -26,6 +26,7 @@ int flash_stm32_fmc_nand_read_page_chunk(const struct device *dev,
 					 const struct nand_flash_address *address,
 					 off_t page_offset, size_t chunk, uint8_t *data);
 
+/* Returns -EBADMSG with the uncorrected spare area in data on an uncorrectable ECC error */
 int flash_stm32_fmc_nand_read_spare_area(const struct device *dev,
 					 const struct nand_flash_address *address, uint8_t *data);
 

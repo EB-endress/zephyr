@@ -206,6 +206,11 @@ static int flash_mt29f4g08_is_bad_block(const struct device *dev, const off_t *o
 	memset(spare_area, 0x00, config->spare_area_size);
 	address = flash_mt29f4g08_calculate_address(config, *offset);
 	ret = flash_stm32_fmc_nand_read_spare_area(config->controller, &address, spare_area);
+	if (ret == -EBADMSG) {
+		/* The marker is still output raw; its bit errors make a good block read as bad */
+		ret = 0;
+	}
+
 	if (ret == 0) {
 		*status = (spare_area[0] != 0xFF) ? FLASH_BLOCK_BAD : FLASH_BLOCK_GOOD;
 	} else {
@@ -232,7 +237,7 @@ static int flash_mt29f4g08_mark_bad_block(const struct device *dev, const off_t 
 	address = flash_mt29f4g08_calculate_address(config, *offset);
 	ret = flash_stm32_fmc_nand_read_spare_area(config->controller, &address, spare_area);
 
-	if (ret != 0) {
+	if ((ret != 0) && (ret != -EBADMSG)) {
 		return ret;
 	}
 
