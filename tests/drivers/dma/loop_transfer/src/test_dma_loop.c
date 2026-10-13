@@ -583,3 +583,80 @@ static int test_loop_repeated_start_stop(const struct device *dma)
 	}
 
 LISTIFY(DMA_TEST_DEV_COUNT, DEFINE_DMA_M2M_LOOP_TESTS, ())
+
+#if defined(CONFIG_DMA_STM32U5)
+#include <cmsis_core.h>
+
+#define LOST_IRQ_CHANNEL CONFIG_DMA_LOOP_TRANSFER_CHANNEL_NR
+#define LOST_IRQ_LINE    DT_IRQ_BY_IDX(DMA_TEST_DEV0_NODE, LOST_IRQ_CHANNEL, irq)
+
+static K_SEM_DEFINE(lost_irq_sem, 0, 1);
+static volatile uint32_t lost_irq_callbacks;
+static volatile int lost_irq_status;
+
+static void lost_irq_callback(const struct device *dma_dev, void *arg, uint32_t id, int status)
+{
+	lost_irq_callbacks++;
+	lost_irq_status = status;
+	k_sem_give(&lost_irq_sem);
+}
+
+/* The transfer completes in hardware, but its completion interrupt never arrives */
+ZTEST(dma_m2m_loop, test_dma0_m2m_stop_after_lost_irq)
+{
+	const struct device *dma = dma_test_devs[0];
+	struct dma_status stat;
+	bool completed;
+	int stop_ret;
+	int status_ret;
+
+	for (int i = 0; i < CONFIG_DMA_LOOP_TRANSFER_SIZE; i++) {
+		tx_data[i] = i;
+	}
+	memset(rx_data, 0, sizeof(rx_data));
+	sys_cache_data_flush_range(tx_data, sizeof(tx_data));
+	sys_cache_data_flush_and_invd_range(rx_data[0], sizeof(rx_data[0]));
+
+	dma_cfg.channel_direction = MEMORY_TO_MEMORY;
+	dma_cfg.source_data_size = 1U;
+	dma_cfg.dest_data_size = 1U;
+	dma_cfg.source_burst_length = 1U;
+	dma_cfg.dest_burst_length = 1U;
+	dma_cfg.user_data = NULL;
+	dma_cfg.dma_callback = lost_irq_callback;
+	dma_cfg.block_count = 1U;
+	dma_cfg.head_block = &dma_block_cfg;
+	dma_block_cfg.block_size = sizeof(tx_data);
+	dma_block_cfg.source_address = (uint32_t)(uintptr_t)tx_data;
+	dma_block_cfg.dest_address = (uint32_t)(uintptr_t)rx_data[0];
+	lost_irq_callbacks = 0U;
+	k_sem_reset(&lost_irq_sem);
+
+	zassert_ok(dma_config(dma, LOST_IRQ_CHANNEL, &dma_cfg));
+
+	irq_disable(LOST_IRQ_LINE);
+	zassert_ok(dma_start(dma, LOST_IRQ_CHANNEL));
+	completed = WAIT_FOR((dma_get_status(dma, LOST_IRQ_CHANNEL, &stat) == 0) &&
+			     (stat.pending_length == 0U), 100000, k_busy_wait(10));
+	stop_ret = dma_stop(dma, LOST_IRQ_CHANNEL);
+	status_ret = dma_get_status(dma, LOST_IRQ_CHANNEL, &stat);
+	NVIC_ClearPendingIRQ(LOST_IRQ_LINE);
+	irq_enable(LOST_IRQ_LINE);
+
+	zassert_true(completed, "transfer did not complete");
+	zassert_ok(stop_ret);
+	zassert_ok(status_ret);
+	zassert_false(stat.busy, "stopped channel is still busy");
+	zassert_equal(lost_irq_callbacks, 0U, "callback after the interrupt was dropped");
+
+	memset(rx_data[0], 0, sizeof(rx_data[0]));
+	sys_cache_data_flush_and_invd_range(rx_data[0], sizeof(rx_data[0]));
+	zassert_ok(dma_config(dma, LOST_IRQ_CHANNEL, &dma_cfg), "stopped channel not reusable");
+	zassert_ok(dma_start(dma, LOST_IRQ_CHANNEL));
+	zassert_ok(k_sem_take(&lost_irq_sem, K_MSEC(SLEEPTIME)));
+	zassert_equal(lost_irq_status, DMA_STATUS_COMPLETE);
+	sys_cache_data_invd_range(rx_data[0], sizeof(rx_data[0]));
+	zassert_mem_equal(tx_data, rx_data[0], sizeof(tx_data));
+	zassert_ok(dma_stop(dma, LOST_IRQ_CHANNEL));
+}
+#endif /* CONFIG_DMA_STM32U5 */

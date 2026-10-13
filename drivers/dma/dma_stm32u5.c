@@ -950,6 +950,9 @@ static int dma_stm32_stop(const struct device *dev, uint32_t id)
 
 	/* Repeated stop : return now if channel is already stopped */
 	if (!stm32_dma_is_enabled_stream(dma, id)) {
+		/* A finished transfer whose interrupt was not handled is still busy */
+		dma_stm32_clear_stream_irq(dev, id);
+		stream->busy = false;
 		return 0;
 	}
 
